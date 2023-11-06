@@ -8,7 +8,7 @@ def get_config():
 
     config.data = mlc.ConfigDict()
     config.data.name = "CIFAR10"
-    config.data.input_shape = (3, 32, 32)  # CIFAR-10 images are 32x32 and RGB
+    config.data.input_shape = (3, 32, 32)  
     config.data.output_dim = 10
     config.data.train_batch_size = 512
     config.data.val_batch_size = 512

@@ -12,11 +12,11 @@ def get_config():
     config.data.output_dim = 10
     config.data.train_batch_size = 512
     config.data.val_batch_size = 512
-    config.data.p = 1.0  # float from (0, 1]
-    config.data.k = 1  # int from 1 to 196
+    config.data.p = 1.0  
+    config.data.k = 1  
 
     config.train = mlc.ConfigDict()
-    config.train.epochs = 10  # Typical epoch range for MNIST
+    config.train.epochs = 10 
     config.train.seed = 123456789
     config.train.checkpoint = False
     config.train.resume_from_checkpoint = False

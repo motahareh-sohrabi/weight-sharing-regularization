@@ -91,4 +91,4 @@ args="--config.data.p $p
 --config.resource.cpus_per_task $cpus_per_task "
 
 
-python ./src/main.py --config=./configs/mnist_14.py $args
+python ./src/main.py --config=./configs/mnist_torus_14.py $args
