@@ -1,3 +1,4 @@
+from dgl.ops import segment_reduce
 import time
 from collections import defaultdict
 
@@ -21,6 +22,15 @@ def train_epoch(
     """
     Trains the model for one epoch.
 
+    Args:
+        model: torch.nn.Module
+        loss_fn: torch.nn.Module
+        optimizer: torch.optim.Optimizer
+        data_loader: torch.utils.data.DataLoader
+        device: torch.device
+
+    Returns:
+        loss: float
     """
 
     model.train()
@@ -54,19 +64,20 @@ def train_epoch(
         target = target.to(device)
 
         output = model(input)
+        loss = loss_fn(output, target)
         if config.regularization.ws_alg == "subgradient":
             reg = get_R(
                 model, config.regularization.ws_lr, config.regularization.prox_layer
             )
-            loss = (
-                loss_fn(output, target)
-                + reg
-                # + config.regularization.lasso_lr * torch.sum(torch.abs(param.data))
-            )
+
+            loss = loss + reg
+            # + config.regularization.lasso_lr * torch.sum(torch.abs(param.data))
+
             if log_ws_metric:
                 wandb.log({"R": reg})
-        else:
-            loss = loss_fn(output, target)
+
+            print("R: ", reg)
+            print("Loss: ", loss)
 
         loss_epoch += loss.item() * input.shape[0]
         acc_epoch += (output.argmax(dim=1) == target).sum().item()
@@ -81,7 +92,9 @@ def train_epoch(
 
         if config.regularization.beta > 0.0:
             for param in model.parameters():
-                param.grad += config.regularization.lmbda * torch.sign(param.data)
+
+                param.grad += config.regularization.lmbda * \
+                    torch.sign(param.data)
 
         optimizer.step()
 
@@ -111,6 +124,22 @@ def train_epoch(
                     elif len(param.data.shape) == 1:
                         metrics[f"Bias Layer_{j+1}"] = (0.0, sparsity)
                         j += 1
+
+        corrected_beta_lasso = False
+
+        if corrected_beta_lasso and config.regularization.beta > 0.0:
+            for param in model.parameters():
+                param.data *= (
+                    torch.abs(param.data)
+                    >= lr_optimizer
+                    * config.regularization.beta
+                    * config.regularization.lmbda
+                )
+
+                param.data += (
+                    -lr_optimizer * config.regularization.lmbda *
+                    torch.sign(param.data)
+                )
 
         # Proximal
         if config.regularization.ws_alg == "subgradient":
@@ -185,6 +214,12 @@ def train_epoch(
                 ws_list[f"Weight Layer_{i+1}"] = ws_list_w
                 ws_list[f"Bias Layer_{i+1}"] = ws_list_b
 
+            # if log_ws_metric and config.regularization.ws_alg == "imminent_collisions":
+            #     for m in metrics:
+            #         if metrics[m][0] < 0.25:
+            #             config.regularization.ws_alg = "search_collisions"
+            #             print("Switching to search collisions")
+
         # print(f"One iteration took {time.time() - start_time} seconds")
 
     loss_epoch = loss_epoch / cnt
@@ -194,6 +229,7 @@ def train_epoch(
 
 
 def get_R(model, ws_lr, prox_layer="FC1"):
+
     R_val = 0.0
 
     is_ws_lr_zero = (isinstance(ws_lr, float) and ws_lr == 0) or (
@@ -212,15 +248,20 @@ def get_R(model, ws_lr, prox_layer="FC1"):
     elif prox_layer == "FC12":
         layers = [model.fc1, model.fc2]
 
+    if not isinstance(ws_lr, tuple):
+        ws_lr_list = [ws_lr] * len(layers)
+    else:
+        ws_lr_list = ws_lr
+
     for i, layer in enumerate(layers):
         weights = layer.weight
         bias = layer.bias
 
-        flatten_weight = weights.data.flatten()
-        flatten_bias = bias.data.flatten()
+        flatten_weight = weights.view(-1)
+        flatten_bias = bias.view(-1)
 
-        R_val += R(flatten_weight)
-        R_val += R(flatten_bias)
+        R_val += R(flatten_weight) * ws_lr_list[i]
+        R_val += R(flatten_bias) * ws_lr_list[i]
 
     return R_val
 
@@ -246,7 +287,8 @@ def get_weight_sharing(m, indices):
 
 def do_weight_sharing(w, cluster_indices):
     with torch.no_grad():
-        w_ = torch.zeros(torch.max(cluster_indices) + 1, device=w.device, dtype=w.dtype)
+        w_ = torch.zeros(torch.max(cluster_indices) + 1,
+                         device=w.device, dtype=w.dtype)
         torch_scatter.scatter(w, cluster_indices, reduce="mean", out=w_)
         torch.gather(w_, 0, cluster_indices, out=w)
         return w
@@ -292,7 +334,8 @@ def prox_R_and_l1(
         x, indices = torch.sort(w)
 
         # apply prox_R
-        v = step_size_R * (n - 2 * torch.arange(n, device=device) - 1) / (n - 1)
+        v = step_size_R * \
+            (n - 2 * torch.arange(n, device=device) - 1) / (n - 1)
         m = torch.ones(n, dtype=torch.long, device=device)
 
         if alg == "search_collisions":
@@ -300,7 +343,9 @@ def prox_R_and_l1(
         elif alg == "end_collisions":
             x, v, m = end_collisions_alg(x, v, m)
         elif alg == "imminent_collisions":
-            x, v, m = imminent_collisions_alg(x, v, m)
+            x, v, m = imminent_collisions_alg_2(x, v, m)
+        elif alg == "pool_adjacent_violators":
+            x, v, m = torch_pool_adjacent_violators(x, v, m)
 
         # get weight sharing
         ws_list = get_weight_sharing(m, indices) if return_ws_list else None
@@ -356,12 +401,13 @@ def end_collisions_alg(x, v, m):
         if i == j:
             i += 1
             continue
-        x[i] = torch.mean(x[i : j + 1])
-        v[i] = torch.mean(v[i : j + 1])
-        m[i] = torch.sum(m[i : j + 1])
-        m[i + 1 : j + 1] = 0
+        x[i] = torch.mean(x[i: j + 1])
+        v[i] = torch.mean(v[i: j + 1])
+        m[i] = torch.sum(m[i: j + 1])
+        m[i + 1: j + 1] = 0
         i = j + 1
     return x, v, m
+
 
 
 def imminent_collisions_step(x, v, m):
@@ -387,6 +433,41 @@ def imminent_collisions_alg(x, v, m):
         x, v, m = imminent_collisions_step(x, v, m)
         if x.shape[0] == old_n:
             break
+    return x, v, m
+
+
+def segment_sum(x, c):
+    x = torch.cumsum(x, dim=0)
+    x = x[~c]
+    if x.shape[0] > 1:
+        x[1:] = x[1:] - x[:-1]
+    return x
+
+
+def imminent_collisions_step_2(x, v, m):
+    n = x.shape[0]
+    if n == 1:
+        return x, v, m
+    c = torch.zeros(n, dtype=bool, device=x.device, requires_grad=False)
+    c[:-1] = (x + v)[:-1] > (x + v)[1:]
+    x = segment_sum(x * m, c)
+    v = segment_sum(v * m, c)
+    m = segment_sum(m, c)
+    x /= m
+    v /= m
+    return x, v, m
+
+
+def imminent_collisions_alg_2(x, v, m):
+    # iteratively detect and perform imminent collisions in parallel
+    num_iters = 0
+    while True:
+        num_iters += 1
+        old_n = x.shape[0]
+        x, v, m = imminent_collisions_step_2(x, v, m)
+        if x.shape[0] == old_n:
+            break
+    print('[v2] num_iters =', num_iters)
     return x, v, m
 
 
@@ -418,19 +499,18 @@ def rightmost_collision_single(x, v, m):
     avg[avg != avg] = float("inf")
     return torch.argmin(avg, dim=0)
 
+# NEW code
 
-def rightmost_collisions(x, v, m, i, m_, verbose=False):
+
+def cumsum_dim1(x):
+    out = torch.cumsum(x.view(-1), dim=0).view(x.shape)
+    out[1:] -= out[:-1, -1][:, None]
+    return out
+
+
+def rightmost_collisions(x, v, m, i):
     device = x.device
     B, n = x.shape[:2]
-
-    if B <= 256:
-        j = torch.zeros_like(i)
-        for k in range(B):
-            j[k] = (
-                rightmost_collision_single(x[k, i[k] :], v[k, i[k] :], m[k, i[k] :])
-                + i[k]
-            )
-        return j
 
     idx = torch.arange(n, device=device)
 
@@ -439,23 +519,13 @@ def rightmost_collisions(x, v, m, i, m_, verbose=False):
 
     # Directly calculate avg with masked operations
     masked_m = torch.where(mask, torch.zeros_like(m), m)
-    cumsum_m = torch.cumsum(masked_m, dim=1)
-    avg = torch.where(
-        cumsum_m == 0, float("inf"), torch.cumsum((x + v) * masked_m, dim=1) / cumsum_m
-    )
-
-    if verbose:
-        print("avg =", avg)
-
-    output = torch.argmin(avg, dim=1)
-    return output
+    cumsum_m = cumsum_dim1(masked_m)
+    avg = torch.where(cumsum_m == 0, float('inf'),
+                      cumsum_dim1((x + v) * masked_m) / cumsum_m)
+    return torch.argmin(avg, dim=1)
 
 
-def merge(x, v, m, m_, verbose=False):
-    if verbose:
-        print("[merge] begin -----------------")
-        print("z =", x + v)
-        print("m =", m)
+def merge(x, v, m):
     device = x.device
     B = x.shape[0]
     n = x.shape[1]
@@ -465,48 +535,27 @@ def merge(x, v, m, m_, verbose=False):
         v[c, 0] = (v[c, 0] + v[c, 1]) / 2
         m[c, 0] = 2
         m[c, 1] = 0
-        if verbose:
-            print("z =", x + v)
-            print("m =", m)
-            print("[merge] end")
         return
     # initialize search range
-    if verbose:
-        print(x + v)
-        print(m)
     le = torch.zeros(B, dtype=torch.long, device=device)
     ri = (n // 2) * torch.ones(B, dtype=torch.long, device=device)
     logn = n.bit_length() - 2
     for _ in range(logn):
-        if verbose:
-            print("le, ri =", le, ri)
         mid = (le + ri - 1) // 2
-        if verbose:
-            print("mid =", mid)
-        j = rightmost_collisions(x, v, m, mid, m_, verbose=verbose)
-        if verbose:
-            print("j =", j)
-        c = j >= n // 2
+        j = rightmost_collisions(x, v, m, mid)
+        c = (j >= n // 2)
         le[~c] = mid[~c] + 1
         ri[c] = mid[c] + 1
-        if verbose:
-            print("le, ri =", le, ri)
     i = le
-    j = rightmost_collisions(x, v, m, i, m_, verbose=verbose)
+    j = rightmost_collisions(x, v, m, i)
     c = (i < n // 2) & (j >= n // 2)
     if ~c.any():
-        if verbose:
-            print("z =", x + v)
-            print("m =", m)
-            print("[merge] end")
         return
-    m_.copy_(m)
+    m_ = m.clone()
     n = x.shape[1]
     idx = torch.arange(n, device=device)
     mask = (idx[None, :] >= i[:, None]) & (idx[None, :] <= j[:, None])
     mask[~c] = 0
-    if verbose:
-        print("mask =", mask)
     m_[~mask] = 0
 
     m_total = torch.sum(m_[c], dim=1)
@@ -514,13 +563,7 @@ def merge(x, v, m, m_, verbose=False):
     v[c, i[c]] = torch.sum(v[c] * m_[c], dim=1) / m_total
     m[c, i[c]] = m_total
     mask[c, i[c]] = 0
-    if verbose:
-        print("mask =", mask)
     m[mask] = 0
-    if verbose:
-        print("z =", x + v)
-        print("m =", m)
-        print("[merge] end")
 
 
 def search_collisions_alg(x, v, m):
@@ -529,23 +572,61 @@ def search_collisions_alg(x, v, m):
     n = x.shape[0]
     logn = (n - 1).bit_length()
     if n & (n - 1) != 0:
-        n_ = 2**logn
+        n_ = 2 ** logn
         x = torch.concatenate((x, torch.zeros(n_ - n, device=device)))
         v = torch.concatenate((v, torch.zeros(n_ - n, device=device)))
-        m = torch.concatenate((m, torch.zeros(n_ - n, dtype=torch.long, device=device)))
-    m_ = m.clone()
+        m = torch.concatenate(
+            (m, torch.zeros(n_ - n, dtype=torch.long, device=device)))
     for i in range(logn):
         psize = 2 ** (i + 1)
         x = x.view(-1, psize)
         v = v.view(-1, psize)
         m = m.view(-1, psize)
-        m_ = m_.view(-1, psize)
         r = (n + psize - 1) // psize
-        merge(x[:r], v[:r], m[:r], m_[:r])
+        merge(x[:r], v[:r], m[:r])
     x = x.view(-1)[:n]
     v = v.view(-1)[:n]
     m = m.view(-1)[:n]
     return x, v, m
+
+
+def pool_adjacent_violators(x_list, v_list, m_list):
+    d = len(x_list)
+    new_x_list = []
+    new_v_list = []
+    new_m_list = []
+    for i in range(d):
+        new_x_list.append(x_list[i])
+        new_v_list.append(v_list[i])
+        new_m_list.append(m_list[i])
+        while len(new_x_list) >= 2 and new_x_list[-1] + new_v_list[-1] < new_x_list[-2] + new_v_list[-2]:
+            new_x_list[-2] = (new_x_list[-2] * new_m_list[-2] + new_x_list[-1]
+                              * new_m_list[-1]) / (new_m_list[-2] + new_m_list[-1])
+            new_v_list[-2] = (new_v_list[-2] * new_m_list[-2] + new_v_list[-1]
+                              * new_m_list[-1]) / (new_m_list[-2] + new_m_list[-1])
+            new_m_list[-2] += new_m_list[-1]
+            new_x_list.pop()
+            new_v_list.pop()
+            new_m_list.pop()
+    return new_x_list, new_v_list, new_m_list
+
+
+def torch_pool_adjacent_violators(x, v, m):
+    device = x.device
+    x_list = x.cpu().tolist()
+    v_list = v.cpu().tolist()
+    m_list = m.cpu().tolist()
+    time0 = time.time()
+    new_x_list, new_v_list, new_m_list = pool_adjacent_violators(
+        x_list, v_list, m_list)
+    time1 = time.time()
+    print('[pava] time', time1 - time0)
+    new_x = torch.tensor(new_x_list, device=device)
+    new_v = torch.tensor(new_v_list, device=device)
+    new_m = torch.tensor(new_m_list, device=device, dtype=torch.long)
+    return new_x, new_v, new_m
+
+
 
 
 def rho_scheduler(epoch, max_epochs, initial_lr=1e-8, final_lr=1.0):
