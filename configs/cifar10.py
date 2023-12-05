@@ -45,7 +45,7 @@ def get_config():
     config.verbose.verbose = True
     config.verbose.log_freq = 1
     config.wandb_mode = "disabled"
-    config.wandb_entity = "motahareh-s"
+    config.wandb_entity = "entity-name"
     config.wandb_project = "proximal-weight-sharing"
 
     config.resource = mlc.ConfigDict()
