@@ -29,16 +29,6 @@ wandb_mode="online"
 # wandb_mode="disabled"
 # wandb_mode="offline"
 
-
-#resource:
-cluster="debug"
-# cluster="ComputeCanada"
-# cluster="Mila"
-
-# partition="long"
-# partition="main"
-# partition="unkillable"
-
 # slurm_time="3-00:00:00"
 slurm_time="2-00:00:00"
 # slurm_time="1-00:00:00"
@@ -50,7 +40,6 @@ slurm_time="2-00:00:00"
 # cpus_per_task=24
 cpus_per_task=4
 
-# entity="motahareh-s"
 
 args="--config.train.epochs $num_epochs
 --config.model.name $model_name
@@ -69,7 +58,6 @@ args="--config.train.epochs $num_epochs
 --config.train.checkpoint $checkpoint
 --config.verbose.verbose True
 --config.verbose.log_freq 1
---config.wandb_entity $entity
 --config.wandb_mode $wandb_mode
 --config.resource.cluster $cluster
 --config.resource.partition $partition
