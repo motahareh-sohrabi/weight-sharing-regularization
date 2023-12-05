@@ -37,15 +37,6 @@ wandb_mode="online"
 # wandb_mode="offline"
 
 
-#resource:
-# cluster="debug"
-# cluster="ComputeCanada"
-cluster="Mila"
-
-# partition="long"
-partition="main"
-#partition="unkillable"
-
 # slurm_time="3-00:00:00"
 slurm_time="2-00:00:00"
 # slurm_time="1-00:00:00"
@@ -57,9 +48,6 @@ slurm_time="2-00:00:00"
 
 # cpus_per_task=24
 cpus_per_task=4
-
-entity="motahareh-s"
-project="mnist-torus"
 
 
 args="--config.data.p $p
